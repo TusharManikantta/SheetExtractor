@@ -3,3 +3,8 @@ pandas
 plotly
 numpy
 openpyxl
+sqlalchemy
+xlsxwriter
+fpdf
+kaleido
+pillow

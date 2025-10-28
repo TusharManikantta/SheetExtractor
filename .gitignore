@@ -1,1 +1,15 @@
-/venv
+# Dependencies and Environments
+/venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints
+
+# IDE and OS Files (Common Exclusions)
+.vscode/  # Exclude VS Code settings
+.idea/    # Exclude PyCharm settings
+.DS_Store # Mac OS files
+Thumbs.db # Windows files
+
+# Streamlit Secrets and Local DB (CRITICAL for security and portability)
+.streamlit/secrets.toml  # Never commit secrets/credentials
+/analytics.db            # Never commit the local database file (it gets recreated)
