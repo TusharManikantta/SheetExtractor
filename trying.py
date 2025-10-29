@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import datetime 
+import datetime # Used for datetime.datetime.now()
 import numpy as np
 from sqlalchemy import create_engine, text
 import os
@@ -10,7 +10,7 @@ import io
 import xlsxwriter
 import tempfile 
 
-# IMPORT THE NEW REPORT UTILS FUNCTIONS (Assume report_utils.py is available)
+# IMPORT THE NEW REPORT UTILS FUNCTIONS (Assumes report_utils.py is in place)
 from report_utils import (
     generate_pdf_report, 
     generate_excel_report, 
@@ -18,12 +18,16 @@ from report_utils import (
 )
 
 # --- Configuration and Page Setup ---
+
+# Database and Table Names 
 SQLITE_DB_NAME = 'analytics.db'
 EVT_TABLE_NAME = 'evt_data'
 CPU_MEM_TABLE_NAME = 'cpu_mem_data'
 
+# Page configuration
 st.set_page_config(page_title="SQLite Analytics Dashboard", layout="wide", page_icon="📊")
 
+# Custom CSS for styling
 st.markdown("""
 <style>
 .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem; }
@@ -42,6 +46,7 @@ if 'data_loaded_db' not in st.session_state:
 if 'is_single_file' not in st.session_state:
     st.session_state.is_single_file = True 
 
+# Aggregation functions mapping for UI to Pandas
 AGG_FUNCTIONS = {
     'SUM': 'sum',
     'AVERAGE': 'mean',
@@ -51,10 +56,11 @@ AGG_FUNCTIONS = {
     'MEDIAN': 'median'
 }
 
-# --- Utility Functions (Complete versions) ---
+# --- Utility Functions ---
 
 @st.cache_resource
 def get_db_connection():
+    """Establish and cache the SQLite database connection using Streamlit secrets."""
     try:
         conn = st.connection("sqlite", type="sql")
         st.session_state.conn = conn
@@ -65,6 +71,7 @@ def get_db_connection():
         return None
 
 def load_data_from_db(conn, table_name):
+    """Fetch all data from the database table."""
     try:
         st.info(f"Fetching data from database table: **{table_name}**...")
         df = conn.query(f'SELECT * FROM "{table_name}"', ttl=3600) 
@@ -80,17 +87,19 @@ def load_data_from_db(conn, table_name):
         return pd.DataFrame()
 
 def to_excel(df, sheet_name="Export"):
+    """Convert DataFrame to an Excel (xlsx) file in memory (bytes)."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=False)
     processed_data = output.getvalue()
     return processed_data
 
-# **INSPECTED AND MODIFIED**
+# --- FIXED INGESTION FUNCTION ---
 def ingest_evt_data(file_list, conn, is_single_file):
     df_list = []
     
     def read_evt_sheets(file, file_name):
+        # file can be UploadedFile or string path (handled by pd.ExcelFile)
         xls = pd.ExcelFile(file)
         evt_sheets = [sheet for sheet in xls.sheet_names if sheet.upper().startswith("EVT")]
         
@@ -102,9 +111,18 @@ def ingest_evt_data(file_list, conn, is_single_file):
         return parsed_dfs
 
     for f in file_list:
-        file_name = getattr(f, 'name', os.path.basename(f))
+        # Determine the file name and the file object used for reading
+        if hasattr(f, 'name'):
+            # Case 1: Streamlit UploadedFile object (in-memory)
+            file_name = f.name
+            file_obj = f
+        else:
+            # Case 2: String path from the folder input (needs os.path.basename)
+            file_name = os.path.basename(f)
+            file_obj = f
+            
         try:
-            evt_sheets = read_evt_sheets(f, file_name)
+            evt_sheets = read_evt_sheets(file_obj, file_name)
             if evt_sheets:
                 df_list.extend(evt_sheets)
             else:
@@ -126,7 +144,6 @@ def ingest_evt_data(file_list, conn, is_single_file):
     st.session_state.data_loaded_db = True
     st.session_state.is_single_file = is_single_file 
     return True
-
 
 def ingest_cpu_mem_data(file_list, conn, is_single_file):
     df_list = []
@@ -152,15 +169,20 @@ def ingest_cpu_mem_data(file_list, conn, is_single_file):
         return sheet_dfs
 
     for f in file_list:
+        # Determine the file object for reading
+        file_obj = f if hasattr(f, 'name') else f # Use f directly for UploadedFile or path string
+        
         try:
-            cpu_mem_sheets = read_cpu_mem_sheets(f)
+            cpu_mem_sheets = read_cpu_mem_sheets(file_obj)
             if cpu_mem_sheets:
                 for sheet_df in cpu_mem_sheets:
                     df_list.append(sheet_df)
             else:
-                st.info(f"File {getattr(f, 'name', f)} ignored (no CPU/Memory Utilization sheets found)")
+                file_name = getattr(f, 'name', os.path.basename(f))
+                st.info(f"File {file_name} ignored (no CPU/Memory Utilization sheets found)")
         except Exception as e:
-            st.warning(f"Could not read {getattr(f, 'name', f)}: {e}")
+            file_name = getattr(f, 'name', os.path.basename(f))
+            st.warning(f"Could not read {file_name}: {e}")
 
     if not df_list:
         st.error("No CPU/Memory Utilization data found in any sheets of the provided Excel files.")
@@ -279,7 +301,6 @@ if conn:
         if st.session_state.data_loaded_db:
             if excel_type == 'EVT' and not st.session_state.df.empty:
                  month_count = len(st.session_state.df['TXN_DATE'].dt.to_period('M').unique())
-                 # Determine if data covers multiple periods, overriding single file upload if necessary
                  st.session_state.is_single_file = (month_count <= 1 and is_single_file_upload)
             else:
                  st.session_state.is_single_file = False
@@ -314,7 +335,6 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
     st.markdown('### 📥 Download Original Files')
     
     if excel_type == 'EVT' and 'Original_File' in df_loaded.columns:
-        # Get unique original filenames
         original_files = sorted(df_loaded['Original_File'].unique())
         
         col_file_select, col_file_download = st.columns([2, 1])
@@ -326,10 +346,7 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
             )
 
         if selected_download_file:
-            # Filter the aggregated data down to the selected file
             df_to_download = df_loaded[df_loaded['Original_File'] == selected_download_file].copy()
-            
-            # Remove the temporary 'Original_File' column from the export
             df_to_download.drop(columns=['Original_File'], inplace=True, errors='ignore')
             
             excel_data = to_excel(df_to_download, sheet_name=target_table)
@@ -344,7 +361,6 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
                     use_container_width=True
                 )
     else:
-        # Fallback for CPU/Mem data or if 'Original_File' column is missing
         st.info("The individual file download option is available only for EVT data with multiple file uploads.")
     
     st.markdown('---')
