@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import datetime 
-from datetime import timedelta # Used for combining date and hour
+from datetime import timedelta 
 import numpy as np
 from sqlalchemy import create_engine, text, inspect
 import os
@@ -77,7 +77,6 @@ def get_db_metrics(db_file_name, conn, table_name):
     # 1. Get File Size
     size_metric = "0 MB"
     try:
-        # Check if the file exists and get its size
         if os.path.exists(db_file_name):
             file_size_bytes = os.path.getsize(db_file_name)
             file_size_mb = file_size_bytes / (1024 * 1024)
@@ -258,6 +257,7 @@ def ingest_data_to_db(df, conn, table_name, file_names_to_delete=None):
                                    {'file_name': file_name})
         
         if not df.empty:
+            # FIX: Ensure all columns exist in the target table on first insertion
             df.to_sql(table_name, connection, if_exists='append', index=False)
             st.success(f"🎉 Successfully ingested {len(df)} new/replaced records.")
         else:
@@ -516,7 +516,7 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
     date_time_col = 'Date_Time'
     
     if analysis_mode == 'Cross-Table: Volume vs. CPU':
-        pass # Logic is self-contained below
+        pass 
     elif analysis_mode == 'Standard EVT Analysis':
         event_col = 'EVENTS'
         source_col = 'SOURCE'
