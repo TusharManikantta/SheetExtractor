@@ -2,15 +2,15 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import datetime # Used for datetime.datetime.now()
+import datetime 
 import numpy as np
 from sqlalchemy import create_engine, text
 import os
 import io
 import xlsxwriter
-import tempfile # Used for temporary report files
+import tempfile 
 
-# IMPORT THE NEW REPORT UTILS FUNCTIONS
+# IMPORT THE NEW REPORT UTILS FUNCTIONS (Assume report_utils.py is available)
 from report_utils import (
     generate_pdf_report, 
     generate_excel_report, 
@@ -18,16 +18,12 @@ from report_utils import (
 )
 
 # --- Configuration and Page Setup ---
-
-# Database and Table Names 
 SQLITE_DB_NAME = 'analytics.db'
 EVT_TABLE_NAME = 'evt_data'
 CPU_MEM_TABLE_NAME = 'cpu_mem_data'
 
-# Page configuration
 st.set_page_config(page_title="SQLite Analytics Dashboard", layout="wide", page_icon="📊")
 
-# Custom CSS for styling
 st.markdown("""
 <style>
 .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem; }
@@ -44,9 +40,8 @@ if 'df' not in st.session_state:
 if 'data_loaded_db' not in st.session_state:
     st.session_state.data_loaded_db = False
 if 'is_single_file' not in st.session_state:
-    st.session_state.is_single_file = True # Default state
+    st.session_state.is_single_file = True 
 
-# Aggregation functions mapping for UI to Pandas
 AGG_FUNCTIONS = {
     'SUM': 'sum',
     'AVERAGE': 'mean',
@@ -56,11 +51,10 @@ AGG_FUNCTIONS = {
     'MEDIAN': 'median'
 }
 
-# --- Utility Functions ---
+# --- Utility Functions (Complete versions) ---
 
 @st.cache_resource
 def get_db_connection():
-    """Establish and cache the SQLite database connection using Streamlit secrets."""
     try:
         conn = st.connection("sqlite", type="sql")
         st.session_state.conn = conn
@@ -71,7 +65,6 @@ def get_db_connection():
         return None
 
 def load_data_from_db(conn, table_name):
-    """Fetch all data from the database table."""
     try:
         st.info(f"Fetching data from database table: **{table_name}**...")
         df = conn.query(f'SELECT * FROM "{table_name}"', ttl=3600) 
@@ -87,31 +80,37 @@ def load_data_from_db(conn, table_name):
         return pd.DataFrame()
 
 def to_excel(df, sheet_name="Export"):
-    """Convert DataFrame to an Excel (xlsx) file in memory (bytes)."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=False)
     processed_data = output.getvalue()
     return processed_data
 
+# **INSPECTED AND MODIFIED**
 def ingest_evt_data(file_list, conn, is_single_file):
     df_list = []
     
-    def read_evt_sheets(file):
+    def read_evt_sheets(file, file_name):
         xls = pd.ExcelFile(file)
         evt_sheets = [sheet for sheet in xls.sheet_names if sheet.upper().startswith("EVT")]
-        return [xls.parse(sheet) for sheet in evt_sheets]
+        
+        parsed_dfs = []
+        for sheet in evt_sheets:
+            sheet_df = xls.parse(sheet)
+            sheet_df['Original_File'] = file_name # NEW: Store filename
+            parsed_dfs.append(sheet_df)
+        return parsed_dfs
 
     for f in file_list:
+        file_name = getattr(f, 'name', os.path.basename(f))
         try:
-            evt_sheets = read_evt_sheets(f)
+            evt_sheets = read_evt_sheets(f, file_name)
             if evt_sheets:
-                for sheet_df in evt_sheets:
-                    df_list.append(sheet_df)
+                df_list.extend(evt_sheets)
             else:
-                st.info(f"File {getattr(f, 'name', f)} ignored (no EVT sheets found)")
+                st.info(f"File {file_name} ignored (no EVT sheets found)")
         except Exception as e:
-            st.warning(f"Could not read {getattr(f, 'name', f)}: {e}")
+            st.warning(f"Could not read {file_name}: {e}")
 
     if not df_list:
         st.error("No EVT data found in any sheets of the provided Excel files.")
@@ -120,14 +119,14 @@ def ingest_evt_data(file_list, conn, is_single_file):
     df_combined = pd.concat(df_list, ignore_index=True)
     df_combined['TXN_DATE'] = pd.to_datetime(df_combined['TXN_DATE'], format="%m/%d/%Y", errors='coerce').dt.date
 
-    # Write to DB
     engine = create_engine(conn._instance.url)
     df_combined.to_sql(EVT_TABLE_NAME, engine, if_exists='replace', index=False)
     st.success(f"🎉 Successfully ingested **{len(df_combined)}** EVT records into the **{EVT_TABLE_NAME}** table.")
     st.session_state.df = load_data_from_db(conn, EVT_TABLE_NAME)
     st.session_state.data_loaded_db = True
-    st.session_state.is_single_file = is_single_file # Store the type of upload
+    st.session_state.is_single_file = is_single_file 
     return True
+
 
 def ingest_cpu_mem_data(file_list, conn, is_single_file):
     df_list = []
@@ -173,7 +172,6 @@ def ingest_cpu_mem_data(file_list, conn, is_single_file):
     df_combined['DATE'] = pd.to_datetime(df_combined['DATE'], errors='coerce').dt.date
     df_combined = df_combined[df_combined["DATE"].notna()].copy()
     
-    # Write to DB
     engine = create_engine(conn._instance.url)
     df_combined.to_sql(CPU_MEM_TABLE_NAME, engine, if_exists='replace', index=False)
     st.success(f"🎉 Successfully ingested **{len(df_combined)}** CPU/Mem records into the **{CPU_MEM_TABLE_NAME}** table.")
@@ -202,7 +200,6 @@ def create_pivot_table(df, rows, columns, values, agg_func='sum'):
         st.error(f"Error creating pivot table: {str(e)}")
         return None
 
-# Placeholder utility functions (kept minimal)
 def apply_time_grouping(df, date_column, grouping, hour_column=None):
     df_copy = df.copy()
     df_copy[date_column] = pd.to_datetime(df_copy[date_column], errors='coerce')
@@ -246,7 +243,7 @@ if conn:
     )
     
     file_list = []
-    is_single_file = (upload_mode == 'Upload Single File')
+    is_single_file_upload = (upload_mode == 'Upload Single File')
 
     # --- File/Folder Selection UI ---
     if upload_mode == 'Upload Single File':
@@ -271,19 +268,19 @@ if conn:
         if st.button(f"🚀 Ingest {excel_type} Data to DB (Replaces '{target_table}')", type="primary", use_container_width=True):
             with st.spinner(f'Ingesting {len(file_list)} file(s)...'):
                 if excel_type == 'EVT':
-                    ingest_evt_data(file_list, conn, is_single_file)
+                    ingest_evt_data(file_list, conn, is_single_file_upload)
                 else:
-                    ingest_cpu_mem_data(file_list, conn, is_single_file)
+                    ingest_cpu_mem_data(file_list, conn, is_single_file_upload)
     
     # --- Load from DB Button ---
     if st.button(f"⬇️ Load Data from '{target_table}' Table for Analysis", use_container_width=True):
         st.session_state.df = load_data_from_db(conn, target_table)
         st.session_state.data_loaded_db = not st.session_state.df.empty
         if st.session_state.data_loaded_db:
-            # Determine if the loaded data represents a single file's content
             if excel_type == 'EVT' and not st.session_state.df.empty:
                  month_count = len(st.session_state.df['TXN_DATE'].dt.to_period('M').unique())
-                 st.session_state.is_single_file = (month_count <= 1)
+                 # Determine if data covers multiple periods, overriding single file upload if necessary
+                 st.session_state.is_single_file = (month_count <= 1 and is_single_file_upload)
             else:
                  st.session_state.is_single_file = False
             st.rerun() 
@@ -295,36 +292,67 @@ df_loaded = st.session_state.df.copy()
 
 if st.session_state.get('data_loaded_db') and not df_loaded.empty:
     
-    # Set the relevant date/event columns based on the loaded data type
     if excel_type == 'EVT':
         date_col = 'TXN_DATE'
         event_col = 'EVENTS'
         source_col = 'SOURCE'
-    else: # CPU and Memory Utilization
+        hour_col_present = 'HOUR' in df_loaded.columns
+        if not hour_col_present:
+             st.warning("The 'HOUR' column is missing from the loaded EVT data. Hourly granularity is unavailable.")
+    else: 
         date_col = 'DATE'
         event_col = 'MAX_EVENTS' 
         source_col = None 
+        hour_col_present = False 
 
     st.markdown("---")
     st.subheader(f"Data Analysis: {excel_type} Data")
     
-    # --- Data Validation and Export Section ---
-    st.markdown('### ⬇️ Download Data for Validation')
-    download_filename = f"{target_table}_Export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    excel_data = to_excel(df_loaded, sheet_name=target_table)
+    # -----------------------------------------------
+    # --- NEW: INDIVIDUAL FILE DOWNLOAD SECTION ---
+    # -----------------------------------------------
+    st.markdown('### 📥 Download Original Files')
     
-    st.download_button(
-        label="📥 Download Currently Loaded DB Data as Excel",
-        data=excel_data,
-        file_name=download_filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="secondary",
-        help=f"Downloads the {target_table} data currently loaded from the SQLite DB."
-    )
+    if excel_type == 'EVT' and 'Original_File' in df_loaded.columns:
+        # Get unique original filenames
+        original_files = sorted(df_loaded['Original_File'].unique())
+        
+        col_file_select, col_file_download = st.columns([2, 1])
+        with col_file_select:
+            selected_download_file = st.selectbox(
+                'Select Original File to Download',
+                original_files,
+                help="Select a file to download the exact data set that was uploaded from that file."
+            )
+
+        if selected_download_file:
+            # Filter the aggregated data down to the selected file
+            df_to_download = df_loaded[df_loaded['Original_File'] == selected_download_file].copy()
+            
+            # Remove the temporary 'Original_File' column from the export
+            df_to_download.drop(columns=['Original_File'], inplace=True, errors='ignore')
+            
+            excel_data = to_excel(df_to_download, sheet_name=target_table)
+            
+            with col_file_download:
+                st.download_button(
+                    label=f"Download {selected_download_file}",
+                    data=excel_data,
+                    file_name=selected_download_file,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True
+                )
+    else:
+        # Fallback for CPU/Mem data or if 'Original_File' column is missing
+        st.info("The individual file download option is available only for EVT data with multiple file uploads.")
+    
     st.markdown('---')
 
 
+    # ------------------------------------
     # --- EVT Analysis (Traffic Volume) ---
+    # ------------------------------------
     if excel_type == 'EVT':
         
         all_sources = sorted(df_loaded[source_col].dropna().unique())
@@ -339,17 +367,19 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
             selected_months = st.multiselect('Filter by Month', all_months, default=all_months)
 
         # GRANULARITY CHANGE: Conditional Granularity
-        granularity_options = ['Hourly', 'Day', 'Week', 'Month']
+        granularity_options = ['Day', 'Week', 'Month']
+        if hour_col_present:
+             granularity_options.insert(0, 'Hourly')
+             
         if not st.session_state.is_single_file:
             granularity_options.append('Quarterly')
             
         granularity = st.selectbox('Graph Granularity', granularity_options)
         
-        # HOURLY FILTER: Show specific day/hour selectors only when hourly granularity is selected on a single file
-        if granularity == 'Hourly' and st.session_state.is_single_file:
+        # HOURLY FILTER: Show specific day/hour selectors 
+        if granularity == 'Hourly' and st.session_state.is_single_file and hour_col_present:
             st.markdown('##### Pinpoint Day & Hour Filter')
             
-            # FIX: Removed .tolist() - all_days is already a list
             all_days = sorted(df_loaded[date_col].dt.date.unique())
             all_hours = sorted(df_loaded['HOUR'].dropna().unique())
             
@@ -359,7 +389,6 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
             with col_dh2:
                 selected_hour = st.selectbox('Select Specific Hour', ['All'] + all_hours)
                 
-            # Filter the DataFrame based on Day and Hour selection
             if selected_day != 'All':
                 df_loaded = df_loaded[df_loaded[date_col].dt.date == selected_day] 
             if selected_hour != 'All':
@@ -437,7 +466,7 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
                 legend={'title': 'Source'}
             )
             fig = go.Figure(data=data, layout=layout)
-            last_fig = fig # Store the last generated figure for reporting
+            last_fig = fig 
             st.plotly_chart(fig, use_container_width=True)
             
         # --- PDF/Excel Report Generation UI for EVT ---
@@ -459,7 +488,6 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
                             df_loaded['TXN_DATE_Month'].isin(report_months)
                         ].copy()
 
-                        # Prepare Summary, Tables, and Figures
                         summary_text = f"""
 **EVT Data Analysis Report**
 Date Range: {report_df[date_col].min().strftime('%Y-%m-%d')} to {report_df[date_col].max().strftime('%Y-%m-%d')}
@@ -487,7 +515,6 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
                             st.download_button(
                                 label="Download PDF Report", data=f.read(), file_name=pdf_filename, mime="application/pdf", key='download_pdf_evt'
                             )
-                        # Clean up the temporary image file
                         if os.path.exists(fig_path):
                             os.remove(fig_path)
                 else:
@@ -497,7 +524,6 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
         with col_excel:
             if st.button('XLSX Generate Excel Report', use_container_width=True):
                 with st.spinner('Generating Excel report...'):
-                    # Filter data for the report (using the same filters as PDF)
                     report_df = df_loaded[
                         df_loaded[source_col].isin(report_sources) & 
                         df_loaded['TXN_DATE_Month'].isin(report_months)
@@ -505,7 +531,7 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
 
                     excel_tables = {
                         "Filtered_Raw_Data": report_df,
-                        "Pivot_Daily_Volume": grouped_df # Use the final grouped data
+                        "Pivot_Daily_Volume": grouped_df
                     }
                     excel_filename = f"EVT_Data_Export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                     excel_path = os.path.join(tempfile.gettempdir(), excel_filename)
@@ -517,14 +543,16 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
                             label="Download Excel Report", data=f.read(), file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key='download_excel_evt'
                         )
 
+    # ----------------------------------------
     # --- CPU/Mem Analysis (Dual-Axis Plot) ---
+    # ----------------------------------------
     else: # excel_type == 'CPU and Memory Utilization'
 
         if 'MAX_EVENTS' not in df_loaded.columns or 'CPU' not in df_loaded.columns:
             st.error("Missing expected columns (MAX_EVENTS, CPU) for this analysis type. Ensure files were ingested correctly.")
             st.stop()
             
-        date_col = 'DATE' # Redefine for clarity
+        date_col = 'DATE' 
 
         df_loaded['Month'] = df_loaded[date_col].dt.to_period('M').astype(str)
         all_months = sorted(df_loaded['Month'].unique())
@@ -544,7 +572,6 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
 
         grouped_df = df_filtered.groupby(group_cols).agg({'MAX_EVENTS': 'sum', 'CPU': 'mean'})
 
-        # Dual-axis Plotting
         bar_trace = go.Bar(
             x=grouped_df.index.astype(str), y=grouped_df['MAX_EVENTS'], yaxis='y1',
             name='Max Events (SUM)', marker_color='rgba(55, 83, 109, 0.7)', hoverinfo='x+y+name'
