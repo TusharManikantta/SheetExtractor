@@ -2,15 +2,15 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import datetime # Used for datetime.datetime.now()
+import datetime 
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect # Added inspect
 import os
 import io
 import xlsxwriter
 import tempfile 
 
-# IMPORT THE NEW REPORT UTILS FUNCTIONS
+# IMPORT THE NEW REPORT UTILS FUNCTIONS (Assumes report_utils.py is in place)
 from report_utils import (
     generate_pdf_report, 
     generate_excel_report, 
@@ -24,10 +24,8 @@ SQLITE_DB_NAME = 'analytics.db'
 EVT_TABLE_NAME = 'evt_data'
 CPU_MEM_TABLE_NAME = 'cpu_mem_data'
 
-# Page configuration
 st.set_page_config(page_title="SQLite Analytics Dashboard", layout="wide", page_icon="📊")
 
-# Custom CSS for styling
 st.markdown("""
 <style>
 .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem; }
@@ -44,9 +42,10 @@ if 'df' not in st.session_state:
 if 'data_loaded_db' not in st.session_state:
     st.session_state.data_loaded_db = False
 if 'is_single_file' not in st.session_state:
-    st.session_state.is_single_file = True # Default state
+    st.session_state.is_single_file = True 
+if 'files_to_ingest' not in st.session_state:
+    st.session_state.files_to_ingest = []
 
-# Aggregation functions mapping for UI to Pandas
 AGG_FUNCTIONS = {
     'SUM': 'sum',
     'AVERAGE': 'mean',
@@ -56,7 +55,36 @@ AGG_FUNCTIONS = {
     'MEDIAN': 'median'
 }
 
-# --- Utility Functions ---
+# --- New: DB Metrics Function ---
+def get_db_metrics(db_file_name, conn, table_name):
+    """Calculates the size of the SQLite DB file and total record count."""
+    
+    # 1. Get File Size
+    size_metric = "0 MB"
+    try:
+        # Check if the file exists and get its size
+        if os.path.exists(db_file_name):
+            file_size_bytes = os.path.getsize(db_file_name)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            size_metric = f"{file_size_mb:.2f} MB"
+    except Exception:
+        pass 
+
+    # 2. Get Total Record Count
+    record_count = 0
+    try:
+        engine = create_engine(conn._instance.url)
+        inspector = inspect(engine)
+        if inspector.has_table(table_name):
+            with engine.connect() as connection:
+                result = connection.execute(text(f'SELECT COUNT(*) FROM "{table_name}"')).scalar()
+                record_count = int(result)
+    except Exception:
+        pass 
+    
+    return size_metric, record_count
+
+# --- Utility Functions (rest of the functions remain the same) ---
 
 @st.cache_resource
 def get_db_connection():
@@ -94,42 +122,65 @@ def to_excel(df, sheet_name="Export"):
     processed_data = output.getvalue()
     return processed_data
 
-def ingest_evt_data(file_list, conn, is_single_file):
-    df_list = []
-    
-    def read_evt_sheets(file):
-        xls = pd.ExcelFile(file)
-        evt_sheets = [sheet for sheet in xls.sheet_names if sheet.upper().startswith("EVT")]
-        return [xls.parse(sheet) for sheet in evt_sheets]
+# --- File Parsing Functions ---
+
+def parse_excel_files(file_list, conn, table_name, file_type):
+    """Reads excel files and performs duplication checks."""
+    engine = create_engine(conn._instance.url)
+    existing_files = []
+    if inspect(engine).has_table(table_name):
+        try:
+            existing_files = pd.read_sql(f'SELECT DISTINCT "Original_File" FROM "{table_name}"', engine)['Original_File'].tolist()
+        except Exception:
+            existing_files = [] 
+
+    new_files_to_ingest = []
+    duplicate_files = []
 
     for f in file_list:
-        try:
-            evt_sheets = read_evt_sheets(f)
-            if evt_sheets:
-                for sheet_df in evt_sheets:
-                    df_list.append(sheet_df)
-            else:
-                st.info(f"File {getattr(f, 'name', f)} ignored (no EVT sheets found)")
-        except Exception as e:
-            st.warning(f"Could not read {getattr(f, 'name', f)}: {e}")
+        file_name = f.name if hasattr(f, 'name') else os.path.basename(f)
+        
+        if file_name in existing_files:
+            duplicate_files.append((f, file_name))
+        else:
+            new_files_to_ingest.append((f, file_name))
+            
+    st.session_state.files_to_ingest = new_files_to_ingest
+    return duplicate_files
 
-    if not df_list:
-        st.error("No EVT data found in any sheets of the provided Excel files.")
-        return False
+# --- Core Ingestion Functions ---
+
+def read_and_process_evt(file_list_tuples):
+    """Processes EVT files into a single DataFrame ready for ingestion."""
+    df_list = []
+    def read_evt_sheets(file, file_name):
+        xls = pd.ExcelFile(file)
+        evt_sheets = [sheet for sheet in xls.sheet_names if sheet.upper().startswith("EVT")]
+        parsed_dfs = []
+        for sheet in evt_sheets:
+            sheet_df = xls.parse(sheet)
+            sheet_df['Original_File'] = file_name 
+            parsed_dfs.append(sheet_df)
+        return parsed_dfs
+
+    for f_obj, file_name in file_list_tuples:
+        try:
+            evt_sheets = read_evt_sheets(f_obj, file_name)
+            if evt_sheets:
+                df_list.extend(evt_sheets)
+            else:
+                st.warning(f"File {file_name} ignored (no EVT sheets found)")
+        except Exception as e:
+            st.error(f"Could not read {file_name}: {e}")
+            
+    if not df_list: return pd.DataFrame()
     
     df_combined = pd.concat(df_list, ignore_index=True)
     df_combined['TXN_DATE'] = pd.to_datetime(df_combined['TXN_DATE'], format="%m/%d/%Y", errors='coerce').dt.date
+    return df_combined
 
-    # Write to DB
-    engine = create_engine(conn._instance.url)
-    df_combined.to_sql(EVT_TABLE_NAME, engine, if_exists='replace', index=False)
-    st.success(f"🎉 Successfully ingested **{len(df_combined)}** EVT records into the **{EVT_TABLE_NAME}** table.")
-    st.session_state.df = load_data_from_db(conn, EVT_TABLE_NAME)
-    st.session_state.data_loaded_db = True
-    st.session_state.is_single_file = is_single_file # Store the type of upload
-    return True
-
-def ingest_cpu_mem_data(file_list, conn, is_single_file):
+def read_and_process_cpu_mem(file_list_tuples):
+    """Processes CPU/Mem files into a single DataFrame ready for ingestion."""
     df_list = []
 
     def read_cpu_mem_sheets(file):
@@ -152,36 +203,51 @@ def ingest_cpu_mem_data(file_list, conn, is_single_file):
                 sheet_dfs.append(df_sheet)
         return sheet_dfs
 
-    for f in file_list:
+    for f_obj, file_name in file_list_tuples:
         try:
-            cpu_mem_sheets = read_cpu_mem_sheets(f)
+            cpu_mem_sheets = read_cpu_mem_sheets(f_obj)
             if cpu_mem_sheets:
                 for sheet_df in cpu_mem_sheets:
+                    sheet_df['Original_File'] = file_name # NEW: Store filename
                     df_list.append(sheet_df)
             else:
-                st.info(f"File {getattr(f, 'name', f)} ignored (no CPU/Memory Utilization sheets found)")
+                st.warning(f"File {file_name} ignored (no CPU/Memory Utilization sheets found)")
         except Exception as e:
-            st.warning(f"Could not read {getattr(f, 'name', f)}: {e}")
+            st.error(f"Could not read {file_name}: {e}")
 
-    if not df_list:
-        st.error("No CPU/Memory Utilization data found in any sheets of the provided Excel files.")
-        return False
-
-    df_combined = pd.concat(df_list, ignore_index=True)
+    if not df_list: return pd.DataFrame()
     
+    df_combined = pd.concat(df_list, ignore_index=True)
     df_combined = df_combined[df_combined['DATE'].notna()].copy()
     df_combined['DATE'] = pd.to_datetime(df_combined['DATE'], errors='coerce').dt.date
     df_combined = df_combined[df_combined["DATE"].notna()].copy()
     
-    # Write to DB
-    engine = create_engine(conn._instance.url)
-    df_combined.to_sql(CPU_MEM_TABLE_NAME, engine, if_exists='replace', index=False)
-    st.success(f"🎉 Successfully ingested **{len(df_combined)}** CPU/Mem records into the **{CPU_MEM_TABLE_NAME}** table.")
-    st.session_state.df = load_data_from_db(conn, CPU_MEM_TABLE_NAME)
-    st.session_state.data_loaded_db = True
-    st.session_state.is_single_file = is_single_file
-    return True
+    return df_combined
 
+def ingest_data_to_db(df, conn, table_name, file_names_to_delete=None):
+    """Deletes old records (if replacing) and appends new data."""
+    engine = create_engine(conn._instance.url)
+    
+    with engine.begin() as connection:
+        if file_names_to_delete:
+            # 1. Delete old versions of files being replaced
+            for file_name in file_names_to_delete:
+                connection.execute(text(f'DELETE FROM "{table_name}" WHERE "Original_File" = :file_name'), 
+                                   {'file_name': file_name})
+        
+        # 2. Append new data
+        if not df.empty:
+            df.to_sql(table_name, connection, if_exists='append', index=False)
+            st.success(f"🎉 Successfully ingested {len(df)} new/replaced records.")
+        else:
+             st.info("No new data to ingest.")
+    
+    # 3. Reload session state
+    st.session_state.df = load_data_from_db(conn, table_name)
+    st.session_state.data_loaded_db = True
+    st.rerun()
+
+# --- Placeholder utility functions (remain the same) ---
 def detect_columns(df):
     columns = df.columns.tolist()
     source_col = next((col for col in columns if 'SOURCE' in col), 'SOURCE')
@@ -245,7 +311,7 @@ if conn:
     )
     
     file_list = []
-    is_single_file = (upload_mode == 'Upload Single File')
+    is_single_file_upload = (upload_mode == 'Upload Single File')
 
     # --- File/Folder Selection UI ---
     if upload_mode == 'Upload Single File':
@@ -265,28 +331,96 @@ if conn:
         elif excel_files:
             file_list = excel_files
     
-    # --- Ingestion Button ---
-    if file_list:
-        if st.button(f"🚀 Ingest {excel_type} Data to DB (Replaces '{target_table}')", type="primary", use_container_width=True):
-            with st.spinner(f'Ingesting {len(file_list)} file(s)...'):
-                if excel_type == 'EVT':
-                    ingest_evt_data(file_list, conn, is_single_file)
-                else:
-                    ingest_cpu_mem_data(file_list, conn, is_single_file)
+    # --- Ingestion Button (START) ---
     
+    if 'duplicates_to_confirm' not in st.session_state:
+        st.session_state.duplicates_to_confirm = []
+    
+    if file_list and not st.session_state.duplicates_to_confirm:
+        if st.button(f"🚀 Prepare {excel_type} Data for Ingestion", type="primary", use_container_width=True):
+            with st.spinner(f'Checking {len(file_list)} file(s) for duplicates...'):
+                
+                # Check file list and separate into new and duplicate
+                duplicates = parse_excel_files(file_list, conn, target_table, excel_type)
+
+                if duplicates:
+                    st.session_state.duplicates_to_confirm = duplicates
+                    st.warning(f"Found {len(duplicates)} file(s) already present in the database. Scroll down to confirm replacement.")
+                    st.rerun()
+                elif st.session_state.files_to_ingest:
+                    st.session_state.duplicates_to_confirm = []
+                    st.session_state.is_single_file = is_single_file_upload
+                    st.info("No duplicates found. Proceeding with ingestion...")
+                    
+                    # Immediate ingestion for new files
+                    if excel_type == 'EVT':
+                        df_to_ingest = read_and_process_evt(st.session_state.files_to_ingest)
+                    else:
+                        df_to_ingest = read_and_process_cpu_mem(st.session_state.files_to_ingest)
+                        
+                    if not df_to_ingest.empty:
+                        ingest_data_to_db(df_to_ingest, conn, target_table)
+
+    # --- Duplicate Confirmation UI ---
+    if st.session_state.duplicates_to_confirm:
+        
+        st.markdown('---')
+        st.error('⚠️ DUPLICATE FILE CONFIRMATION REQUIRED')
+        st.info("The files below are already in the database. Choose whether to replace them.")
+        
+        duplicate_files = st.session_state.duplicates_to_confirm
+        files_to_replace = st.multiselect(
+            'Select files to **REPLACE** (delete old version and insert new)',
+            [name for _, name in duplicate_files],
+            key='files_to_replace'
+        )
+
+        if st.button('✅ Confirm Ingestion and Replace', type='primary'):
+            files_to_process = st.session_state.files_to_ingest # New files
+            files_to_delete_names = []
+            
+            # Identify files marked for replacement
+            for f_obj, file_name in duplicate_files:
+                if file_name in files_to_replace:
+                    files_to_process.append((f_obj, file_name))
+                    files_to_delete_names.append(file_name)
+                # Files NOT selected for replacement are skipped entirely
+
+            # Read and process all files (new + replacements)
+            if excel_type == 'EVT':
+                df_to_ingest = read_and_process_evt(files_to_process)
+            else:
+                df_to_ingest = read_and_process_cpu_mem(files_to_process)
+                
+            if not df_to_ingest.empty or files_to_delete_names:
+                ingest_data_to_db(df_to_ingest, conn, target_table, file_names_to_delete=files_to_delete_names)
+
+            st.session_state.duplicates_to_confirm = [] # Clear the state
+            st.rerun()
+
     # --- Load from DB Button ---
-    if st.button(f"⬇️ Load Data from '{target_table}' Table for Analysis", use_container_width=True):
+    if st.button(f"⬇️ Load Data from '{target_table}' Table for Analysis", use_container_width=True, key='load_db_btn'):
         st.session_state.df = load_data_from_db(conn, target_table)
         st.session_state.data_loaded_db = not st.session_state.df.empty
         if st.session_state.data_loaded_db:
-            # Determine if the loaded data represents a single file's content
             if excel_type == 'EVT' and not st.session_state.df.empty:
                  month_count = len(st.session_state.df['TXN_DATE'].dt.to_period('M').unique())
-                 st.session_state.is_single_file = (month_count <= 1)
+                 st.session_state.is_single_file = (month_count <= 1 and is_single_file_upload)
             else:
                  st.session_state.is_single_file = False
             st.rerun() 
-
+            
+    # --- DB Storage Metrics Display ---
+    if conn:
+        db_size, total_records = get_db_metrics(SQLITE_DB_NAME, conn, target_table)
+        
+        st.markdown('---')
+        st.markdown('##### 📊 Current DB Storage Metrics')
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.metric(label=f"💾 Size of {SQLITE_DB_NAME}", value=db_size)
+        with col_s2:
+            st.metric(label=f"🔢 Total Records in '{target_table}'", value=f"{total_records:,}")
 
 # --- Analysis Section (Conditionally rendered) ---
 
@@ -294,37 +428,56 @@ df_loaded = st.session_state.df.copy()
 
 if st.session_state.get('data_loaded_db') and not df_loaded.empty:
     
-    # Set the relevant date/event columns based on the loaded data type
     if excel_type == 'EVT':
         date_col = 'TXN_DATE'
         event_col = 'EVENTS'
         source_col = 'SOURCE'
-        # Check for HOUR column presence
         hour_col_present = 'HOUR' in df_loaded.columns
         if not hour_col_present:
              st.warning("The 'HOUR' column is missing from the loaded EVT data. Hourly granularity is unavailable.")
-    else: # CPU and Memory Utilization
+    else: 
         date_col = 'DATE'
         event_col = 'MAX_EVENTS' 
         source_col = None 
-        hour_col_present = False # Not relevant for this analysis type
+        hour_col_present = False 
 
     st.markdown("---")
     st.subheader(f"Data Analysis: {excel_type} Data")
     
-    # --- Data Validation and Export Section ---
-    st.markdown('### ⬇️ Download Data for Validation')
-    download_filename = f"{target_table}_Export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    excel_data = to_excel(df_loaded, sheet_name=target_table)
+    # -----------------------------------------------
+    # --- INDIVIDUAL FILE DOWNLOAD SECTION ---
+    # -----------------------------------------------
+    st.markdown('### 📥 Download Original Files')
     
-    st.download_button(
-        label="📥 Download Currently Loaded DB Data as Excel",
-        data=excel_data,
-        file_name=download_filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="secondary",
-        help=f"Downloads the {target_table} data currently loaded from the SQLite DB."
-    )
+    if excel_type == 'EVT' and 'Original_File' in df_loaded.columns:
+        original_files = sorted(df_loaded['Original_File'].unique())
+        
+        col_file_select, col_file_download = st.columns([2, 1])
+        with col_file_select:
+            selected_download_file = st.selectbox(
+                'Select Original File to Download',
+                original_files,
+                help="Select a file to download the exact data set that was uploaded from that file."
+            )
+
+        if selected_download_file:
+            df_to_download = df_loaded[df_loaded['Original_File'] == selected_download_file].copy()
+            df_to_download.drop(columns=['Original_File'], inplace=True, errors='ignore')
+            
+            excel_data = to_excel(df_to_download, sheet_name=target_table)
+            
+            with col_file_download:
+                st.download_button(
+                    label=f"Download {selected_download_file}",
+                    data=excel_data,
+                    file_name=selected_download_file,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True
+                )
+    else:
+        st.info("The individual file download option is available only for EVT data with multiple file uploads.")
+    
     st.markdown('---')
 
 
@@ -358,7 +511,6 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
         if granularity == 'Hourly' and st.session_state.is_single_file and hour_col_present:
             st.markdown('##### Pinpoint Day & Hour Filter')
             
-            # FIX: Removed .tolist() 
             all_days = sorted(df_loaded[date_col].dt.date.unique())
             all_hours = sorted(df_loaded['HOUR'].dropna().unique())
             
@@ -368,7 +520,6 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
             with col_dh2:
                 selected_hour = st.selectbox('Select Specific Hour', ['All'] + all_hours)
                 
-            # Filter the DataFrame based on Day and Hour selection
             if selected_day != 'All':
                 df_loaded = df_loaded[df_loaded[date_col].dt.date == selected_day] 
             if selected_hour != 'All':
@@ -446,7 +597,7 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
                 legend={'title': 'Source'}
             )
             fig = go.Figure(data=data, layout=layout)
-            last_fig = fig # Store the last generated figure for reporting
+            last_fig = fig 
             st.plotly_chart(fig, use_container_width=True)
             
         # --- PDF/Excel Report Generation UI for EVT ---
@@ -468,7 +619,6 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
                             df_loaded['TXN_DATE_Month'].isin(report_months)
                         ].copy()
 
-                        # Prepare Summary, Tables, and Figures
                         summary_text = f"""
 **EVT Data Analysis Report**
 Date Range: {report_df[date_col].min().strftime('%Y-%m-%d')} to {report_df[date_col].max().strftime('%Y-%m-%d')}
@@ -496,7 +646,6 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
                             st.download_button(
                                 label="Download PDF Report", data=f.read(), file_name=pdf_filename, mime="application/pdf", key='download_pdf_evt'
                             )
-                        # Clean up the temporary image file
                         if os.path.exists(fig_path):
                             os.remove(fig_path)
                 else:
@@ -506,7 +655,6 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
         with col_excel:
             if st.button('XLSX Generate Excel Report', use_container_width=True):
                 with st.spinner('Generating Excel report...'):
-                    # Filter data for the report (using the same filters as PDF)
                     report_df = df_loaded[
                         df_loaded[source_col].isin(report_sources) & 
                         df_loaded['TXN_DATE_Month'].isin(report_months)
@@ -514,7 +662,7 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
 
                     excel_tables = {
                         "Filtered_Raw_Data": report_df,
-                        "Pivot_Daily_Volume": grouped_df # Use the final grouped data
+                        "Pivot_Daily_Volume": grouped_df
                     }
                     excel_filename = f"EVT_Data_Export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                     excel_path = os.path.join(tempfile.gettempdir(), excel_filename)
@@ -535,7 +683,7 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
             st.error("Missing expected columns (MAX_EVENTS, CPU) for this analysis type. Ensure files were ingested correctly.")
             st.stop()
             
-        date_col = 'DATE' # Redefine for clarity
+        date_col = 'DATE' 
 
         df_loaded['Month'] = df_loaded[date_col].dt.to_period('M').astype(str)
         all_months = sorted(df_loaded['Month'].unique())
@@ -555,7 +703,6 @@ Total Events (SUM): {report_df[event_col].sum():,.0f}
 
         grouped_df = df_filtered.groupby(group_cols).agg({'MAX_EVENTS': 'sum', 'CPU': 'mean'})
 
-        # Dual-axis Plotting
         bar_trace = go.Bar(
             x=grouped_df.index.astype(str), y=grouped_df['MAX_EVENTS'], yaxis='y1',
             name='Max Events (SUM)', marker_color='rgba(55, 83, 109, 0.7)', hoverinfo='x+y+name'
