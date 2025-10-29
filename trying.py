@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import datetime # Used for datetime.datetime.now()
+import datetime 
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect 
 import os
 import io
 import xlsxwriter
@@ -24,10 +24,8 @@ SQLITE_DB_NAME = 'analytics.db'
 EVT_TABLE_NAME = 'evt_data'
 CPU_MEM_TABLE_NAME = 'cpu_mem_data'
 
-# Page configuration
 st.set_page_config(page_title="SQLite Analytics Dashboard", layout="wide", page_icon="📊")
 
-# Custom CSS for styling
 st.markdown("""
 <style>
 .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem; }
@@ -45,8 +43,12 @@ if 'data_loaded_db' not in st.session_state:
     st.session_state.data_loaded_db = False
 if 'is_single_file' not in st.session_state:
     st.session_state.is_single_file = True 
+if 'files_to_ingest' not in st.session_state:
+    st.session_state.files_to_ingest = []
+if 'duplicates_to_confirm' not in st.session_state:
+    st.session_state.duplicates_to_confirm = []
 
-# Aggregation functions mapping for UI to Pandas
+
 AGG_FUNCTIONS = {
     'SUM': 'sum',
     'AVERAGE': 'mean',
@@ -55,6 +57,34 @@ AGG_FUNCTIONS = {
     'MIN': 'min',
     'MEDIAN': 'median'
 }
+
+# --- New: DB Metrics Function ---
+def get_db_metrics(db_file_name, conn, table_name):
+    """Calculates the size of the SQLite DB file and total record count."""
+    
+    # 1. Get File Size
+    size_metric = "0 MB"
+    try:
+        if os.path.exists(db_file_name):
+            file_size_bytes = os.path.getsize(db_file_name)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            size_metric = f"{file_size_mb:.2f} MB"
+    except Exception:
+        pass 
+
+    # 2. Get Total Record Count
+    record_count = 0
+    try:
+        engine = create_engine(conn._instance.url)
+        inspector = inspect(engine)
+        if inspector.has_table(table_name):
+            with engine.connect() as connection:
+                result = connection.execute(text(f'SELECT COUNT(*) FROM "{table_name}"')).scalar()
+                record_count = int(result)
+    except Exception:
+        pass 
+    
+    return size_metric, record_count
 
 # --- Utility Functions ---
 
@@ -94,58 +124,63 @@ def to_excel(df, sheet_name="Export"):
     processed_data = output.getvalue()
     return processed_data
 
-# --- FIXED INGESTION FUNCTION ---
-def ingest_evt_data(file_list, conn, is_single_file):
+# --- File Parsing/Ingestion Utility Functions ---
+
+def parse_excel_files(file_list, conn, table_name, file_type):
+    """Reads excel files and performs duplication checks."""
+    engine = create_engine(conn._instance.url)
+    existing_files = []
+    if inspect(engine).has_table(table_name):
+        try:
+            existing_files = pd.read_sql(f'SELECT DISTINCT "Original_File" FROM "{table_name}"', engine)['Original_File'].tolist()
+        except Exception:
+            existing_files = [] 
+
+    new_files_to_ingest = []
+    duplicate_files = []
+
+    for f in file_list:
+        file_name = f.name if hasattr(f, 'name') else os.path.basename(f)
+        
+        if file_name in existing_files:
+            duplicate_files.append((f, file_name))
+        else:
+            new_files_to_ingest.append((f, file_name))
+            
+    st.session_state.files_to_ingest = new_files_to_ingest
+    return duplicate_files
+
+def read_and_process_evt(file_list_tuples):
+    """Processes EVT files into a single DataFrame ready for ingestion."""
     df_list = []
-    
     def read_evt_sheets(file, file_name):
-        # file can be UploadedFile or string path (handled by pd.ExcelFile)
         xls = pd.ExcelFile(file)
         evt_sheets = [sheet for sheet in xls.sheet_names if sheet.upper().startswith("EVT")]
-        
         parsed_dfs = []
         for sheet in evt_sheets:
             sheet_df = xls.parse(sheet)
-            sheet_df['Original_File'] = file_name # NEW: Store filename
+            sheet_df['Original_File'] = file_name 
             parsed_dfs.append(sheet_df)
         return parsed_dfs
 
-    for f in file_list:
-        # Determine the file name and the file object used for reading
-        if hasattr(f, 'name'):
-            # Case 1: Streamlit UploadedFile object (in-memory)
-            file_name = f.name
-            file_obj = f
-        else:
-            # Case 2: String path from the folder input (needs os.path.basename)
-            file_name = os.path.basename(f)
-            file_obj = f
-            
+    for f_obj, file_name in file_list_tuples:
         try:
-            evt_sheets = read_evt_sheets(file_obj, file_name)
+            evt_sheets = read_evt_sheets(f_obj, file_name)
             if evt_sheets:
                 df_list.extend(evt_sheets)
             else:
-                st.info(f"File {file_name} ignored (no EVT sheets found)")
+                st.warning(f"File {file_name} ignored (no EVT sheets found)")
         except Exception as e:
-            st.warning(f"Could not read {file_name}: {e}")
-
-    if not df_list:
-        st.error("No EVT data found in any sheets of the provided Excel files.")
-        return False
+            st.error(f"Could not read {file_name}: {e}")
+            
+    if not df_list: return pd.DataFrame()
     
     df_combined = pd.concat(df_list, ignore_index=True)
     df_combined['TXN_DATE'] = pd.to_datetime(df_combined['TXN_DATE'], format="%m/%d/%Y", errors='coerce').dt.date
+    return df_combined
 
-    engine = create_engine(conn._instance.url)
-    df_combined.to_sql(EVT_TABLE_NAME, engine, if_exists='replace', index=False)
-    st.success(f"🎉 Successfully ingested **{len(df_combined)}** EVT records into the **{EVT_TABLE_NAME}** table.")
-    st.session_state.df = load_data_from_db(conn, EVT_TABLE_NAME)
-    st.session_state.data_loaded_db = True
-    st.session_state.is_single_file = is_single_file 
-    return True
-
-def ingest_cpu_mem_data(file_list, conn, is_single_file):
+def read_and_process_cpu_mem(file_list_tuples):
+    """Processes CPU/Mem files into a single DataFrame ready for ingestion."""
     df_list = []
 
     def read_cpu_mem_sheets(file):
@@ -168,39 +203,49 @@ def ingest_cpu_mem_data(file_list, conn, is_single_file):
                 sheet_dfs.append(df_sheet)
         return sheet_dfs
 
-    for f in file_list:
-        # Determine the file object for reading
-        file_obj = f if hasattr(f, 'name') else f # Use f directly for UploadedFile or path string
-        
+    for f_obj, file_name in file_list_tuples:
         try:
-            cpu_mem_sheets = read_cpu_mem_sheets(file_obj)
+            cpu_mem_sheets = read_cpu_mem_sheets(f_obj)
             if cpu_mem_sheets:
                 for sheet_df in cpu_mem_sheets:
+                    sheet_df['Original_File'] = file_name # NEW: Store filename
                     df_list.append(sheet_df)
             else:
-                file_name = getattr(f, 'name', os.path.basename(f))
-                st.info(f"File {file_name} ignored (no CPU/Memory Utilization sheets found)")
+                st.warning(f"File {file_name} ignored (no CPU/Memory Utilization sheets found)")
         except Exception as e:
-            file_name = getattr(f, 'name', os.path.basename(f))
-            st.warning(f"Could not read {file_name}: {e}")
+            st.error(f"Could not read {file_name}: {e}")
 
-    if not df_list:
-        st.error("No CPU/Memory Utilization data found in any sheets of the provided Excel files.")
-        return False
-
-    df_combined = pd.concat(df_list, ignore_index=True)
+    if not df_list: return pd.DataFrame()
     
+    df_combined = pd.concat(df_list, ignore_index=True)
     df_combined = df_combined[df_combined['DATE'].notna()].copy()
     df_combined['DATE'] = pd.to_datetime(df_combined['DATE'], errors='coerce').dt.date
     df_combined = df_combined[df_combined["DATE"].notna()].copy()
     
+    return df_combined
+
+def ingest_data_to_db(df, conn, table_name, file_names_to_delete=None):
+    """Deletes old records (if replacing) and appends new data."""
     engine = create_engine(conn._instance.url)
-    df_combined.to_sql(CPU_MEM_TABLE_NAME, engine, if_exists='replace', index=False)
-    st.success(f"🎉 Successfully ingested **{len(df_combined)}** CPU/Mem records into the **{CPU_MEM_TABLE_NAME}** table.")
-    st.session_state.df = load_data_from_db(conn, CPU_MEM_TABLE_NAME)
+    
+    with engine.begin() as connection:
+        if file_names_to_delete:
+            # 1. Delete old versions of files being replaced
+            for file_name in file_names_to_delete:
+                connection.execute(text(f'DELETE FROM "{table_name}" WHERE "Original_File" = :file_name'), 
+                                   {'file_name': file_name})
+        
+        # 2. Append new data
+        if not df.empty:
+            df.to_sql(table_name, connection, if_exists='append', index=False)
+            st.success(f"🎉 Successfully ingested {len(df)} new/replaced records.")
+        else:
+             st.info("No new data to ingest.")
+    
+    # 3. Reload session state
+    st.session_state.df = load_data_from_db(conn, table_name)
     st.session_state.data_loaded_db = True
-    st.session_state.is_single_file = is_single_file
-    return True
+    st.rerun()
 
 def detect_columns(df):
     columns = df.columns.tolist()
@@ -281,21 +326,73 @@ if conn:
             excel_files = st.file_uploader("Or upload multiple Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
         
         if folder_path and os.path.isdir(folder_path):
+            # Read paths from folder
             file_list = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if (f.endswith('.xlsx') or f.endswith('.xls')) and not f.startswith('~$')]
         elif excel_files:
+            # Read uploaded files
             file_list = excel_files
     
-    # --- Ingestion Button ---
-    if file_list:
-        if st.button(f"🚀 Ingest {excel_type} Data to DB (Replaces '{target_table}')", type="primary", use_container_width=True):
-            with st.spinner(f'Ingesting {len(file_list)} file(s)...'):
-                if excel_type == 'EVT':
-                    ingest_evt_data(file_list, conn, is_single_file_upload)
-                else:
-                    ingest_cpu_mem_data(file_list, conn, is_single_file_upload)
+    # --- Ingestion Button (START) ---
     
+    if file_list and not st.session_state.duplicates_to_confirm:
+        if st.button(f"🚀 Prepare {excel_type} Data for Ingestion", type="primary", use_container_width=True):
+            with st.spinner(f'Checking {len(file_list)} file(s) for duplicates...'):
+                
+                duplicates = parse_excel_files(file_list, conn, target_table, excel_type)
+
+                if duplicates:
+                    st.session_state.duplicates_to_confirm = duplicates
+                    st.warning(f"Found {len(duplicates)} file(s) already present in the database. Scroll down to confirm replacement.")
+                    st.rerun()
+                elif st.session_state.files_to_ingest:
+                    st.session_state.duplicates_to_confirm = []
+                    st.session_state.is_single_file = is_single_file_upload
+                    st.info("No duplicates found. Proceeding with ingestion...")
+                    
+                    if excel_type == 'EVT':
+                        df_to_ingest = read_and_process_evt(st.session_state.files_to_ingest)
+                    else:
+                        df_to_ingest = read_and_process_cpu_mem(st.session_state.files_to_ingest)
+                        
+                    if not df_to_ingest.empty:
+                        ingest_data_to_db(df_to_ingest, conn, target_table)
+
+    # --- Duplicate Confirmation UI ---
+    if st.session_state.duplicates_to_confirm:
+        
+        st.markdown('---')
+        st.error('⚠️ DUPLICATE FILE CONFIRMATION REQUIRED')
+        st.info("The files below are already in the database. Choose whether to replace them.")
+        
+        duplicate_files = st.session_state.duplicates_to_confirm
+        files_to_replace = st.multiselect(
+            'Select files to **REPLACE** (delete old version and insert new)',
+            [name for _, name in duplicate_files],
+            key='files_to_replace'
+        )
+
+        if st.button('✅ Confirm Ingestion and Replace', type='primary'):
+            files_to_process = st.session_state.files_to_ingest
+            files_to_delete_names = []
+            
+            for f_obj, file_name in duplicate_files:
+                if file_name in files_to_replace:
+                    files_to_process.append((f_obj, file_name))
+                    files_to_delete_names.append(file_name)
+
+            if excel_type == 'EVT':
+                df_to_ingest = read_and_process_evt(files_to_process)
+            else:
+                df_to_ingest = read_and_process_cpu_mem(files_to_process)
+                
+            if not df_to_ingest.empty or files_to_delete_names:
+                ingest_data_to_db(df_to_ingest, conn, target_table, file_names_to_delete=files_to_delete_names)
+
+            st.session_state.duplicates_to_confirm = [] 
+            st.rerun()
+
     # --- Load from DB Button ---
-    if st.button(f"⬇️ Load Data from '{target_table}' Table for Analysis", use_container_width=True):
+    if st.button(f"⬇️ Load Data from '{target_table}' Table for Analysis", use_container_width=True, key='load_db_btn'):
         st.session_state.df = load_data_from_db(conn, target_table)
         st.session_state.data_loaded_db = not st.session_state.df.empty
         if st.session_state.data_loaded_db:
@@ -305,6 +402,80 @@ if conn:
             else:
                  st.session_state.is_single_file = False
             st.rerun() 
+            
+    # --- DB Storage Metrics Display ---
+    if conn:
+        db_size, total_records = get_db_metrics(SQLITE_DB_NAME, conn, target_table)
+        
+        st.markdown('---')
+        st.markdown('##### 📊 Current DB Storage Metrics')
+        
+        # Display the DB location for clarity
+        st.caption(f"DB Location: {os.path.abspath(SQLITE_DB_NAME)}")
+        
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.metric(label=f"💾 Size of {SQLITE_DB_NAME}", value=db_size)
+        with col_s2:
+            st.metric(label=f"🔢 Total Records in '{target_table}'", value=f"{total_records:,}")
+
+
+    # ----------------------------------------
+    # --- NEW: VIEW AND DELETE FILES SECTION ---
+    # ----------------------------------------
+    st.markdown('---')
+    st.markdown('##### 🔎 View & Manage Ingested Files')
+    
+    if 'Original_File' in st.session_state.df.columns:
+        all_unique_files = sorted(st.session_state.df['Original_File'].unique())
+    else:
+        all_unique_files = []
+
+    # 1. View Files Table
+    if st.button(f'Show File Inventory for "{target_table}"', key='show_files', use_container_width=True):
+        try:
+            engine = create_engine(conn._instance.url)
+            query = f"""
+                SELECT "Original_File", COUNT(*) as "Record_Count"
+                FROM "{target_table}"
+                GROUP BY "Original_File"
+                ORDER BY "Record_Count" DESC
+            """
+            files_df = pd.read_sql(query, engine)
+            st.dataframe(files_df, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error viewing files: {e}")
+
+
+    # 2. Delete Files Controls
+    if all_unique_files:
+        st.markdown('###### 🗑️ Delete Files Permanently')
+        
+        files_to_delete_select = st.multiselect(
+            'Select files to permanently delete from DB:',
+            all_unique_files,
+            key='files_to_delete_key'
+        )
+
+        if st.button('💣 DELETE SELECTED FILES', type='secondary', use_container_width=True):
+            if files_to_delete_select:
+                engine = create_engine(conn._instance.url)
+                
+                with st.spinner(f"Deleting {len(files_to_delete_select)} files..."):
+                    with engine.begin() as connection:
+                        for file_name in files_to_delete_select:
+                            connection.execute(
+                                text(f'DELETE FROM "{target_table}" WHERE "Original_File" = :file_name'), 
+                                {'file_name': file_name}
+                            )
+                    
+                    st.success(f"Successfully deleted {len(files_to_delete_select)} file(s) from '{target_table}'.")
+                    
+                    # Refresh the data and metrics
+                    st.session_state.data_loaded_db = False
+                    st.rerun()
+            else:
+                st.warning("Please select at least one file to delete.")
 
 
 # --- Analysis Section (Conditionally rendered) ---
@@ -330,7 +501,7 @@ if st.session_state.get('data_loaded_db') and not df_loaded.empty:
     st.subheader(f"Data Analysis: {excel_type} Data")
     
     # -----------------------------------------------
-    # --- NEW: INDIVIDUAL FILE DOWNLOAD SECTION ---
+    # --- INDIVIDUAL FILE DOWNLOAD SECTION ---
     # -----------------------------------------------
     st.markdown('### 📥 Download Original Files')
     
